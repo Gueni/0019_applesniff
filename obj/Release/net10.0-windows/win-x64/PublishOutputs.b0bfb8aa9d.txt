@@ -1,0 +1,2 @@
+D:\WORKSPACE\0019_applesniff\publish\AppleSniff.pdb
+D:\WORKSPACE\0019_applesniff\publish\AppleSniff.exe
