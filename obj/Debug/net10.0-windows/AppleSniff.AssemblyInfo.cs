@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("AppleSniff")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Debug")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+568effaa459a55b68275e0d278dcc450fe52e0ad")]
 [assembly: System.Reflection.AssemblyProductAttribute("AppleSniff")]
 [assembly: System.Reflection.AssemblyTitleAttribute("AppleSniff")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
