@@ -1,8 +1,8 @@
 using System.IO;
 
-namespace AppleSniff;
+namespace Sniffer;
 
-/// <summary>Plain-text diagnostics in %AppData%\AppleSniff\log.txt, kept small.</summary>
+/// <summary>Plain-text diagnostics in %AppData%\Sniffer\log.txt, kept small.</summary>
 public static class Log
 {
     private static readonly object Gate = new();

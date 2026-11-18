@@ -1,40 +1,46 @@
-﻿using System.Diagnostics;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Windows;
+using System.Windows.Controls;
 using System.Windows.Interop;
 using System.Windows.Media;
 using System.Windows.Shell;
 using System.Windows.Threading;
 using MediaDevices;
 
-namespace AppleSniff;
+namespace Sniffer;
 
 public partial class MainWindow : Window
 {
     private enum Stage { NoDevice, Locked, Scanning, Ready, Copying, Done }
 
-    private static readonly Brush DotIdle = new SolidColorBrush(Color.FromRgb(0x8A, 0x8A, 0x8A));
-    private static readonly Brush DotWaiting = new SolidColorBrush(Color.FromRgb(0xF2, 0xA9, 0x00));
-    private static readonly Brush DotOnline = new SolidColorBrush(Color.FromRgb(0x2E, 0xBD, 0x59));
+    private static readonly Brush DotIdle = new SolidColorBrush(Color.FromRgb(0x6E, 0x6A, 0x7E));
+    private static readonly Brush DotWaiting = new SolidColorBrush(Color.FromRgb(0xF5, 0xB8, 0x41));
+    private static readonly Brush DotOnline = new SolidColorBrush(Color.FromRgb(0x4A, 0xDE, 0x80));
 
     private readonly Settings _settings = Settings.Load();
     private readonly DispatcherTimer _pollTimer = new() { Interval = TimeSpan.FromSeconds(1.5) };
     private readonly DispatcherTimer _copyTimer = new() { Interval = TimeSpan.FromMilliseconds(150) };
     private readonly Queue<(long Ticks, long Bytes)> _speedSamples = new();
     private readonly bool _loaded;
-    private readonly string? _demoFolder = Environment.GetEnvironmentVariable("APPLESNIFF_DEMO") is { Length: > 0 } demo && Directory.Exists(demo) ? demo : null;
+    private readonly string? _demoFolder = Environment.GetEnvironmentVariable("SNIFFER_DEMO") is { Length: > 0 } demo && Directory.Exists(demo) ? demo : null;
 
     private Stage _stage = Stage.NoDevice;
+    private List<PhoneInfo> _phones = new();
+    private PhoneInfo? _phone;          // the phone being shown (connected, locked or being read)
+    private string? _chosenId;          // picked by hand from the header when several are plugged in
     private MediaDevice? _device;
     private string _deviceId = "";
     private List<MediaItem> _items = new();
     private CopyPlan? _plan;
+    private int _selectedCount;
     private CopyProgress? _progress;
     private CancellationTokenSource? _scanCts;
     private CancellationTokenSource? _planCts;
     private CancellationTokenSource? _copyCts;
     private bool _polling;
+    private bool _autoStarted;
     private bool _closeWhenDone;
     private string _errorLogPath = "";
 
@@ -44,19 +50,30 @@ public partial class MainWindow : Window
 
         DestBox.Text = _settings.Destination ?? "";
         LayoutBox.SelectedIndex = (int)_settings.Layout;
+        PhotosCheck.IsChecked = _settings.IncludePhotos;
+        VideosCheck.IsChecked = _settings.IncludeVideos;
+        DateBox.SelectedIndex = Math.Clamp(_settings.DateFilter, 0, 4);
+        SincePicker.SelectedDate = _settings.Since;
+        SinceRow.Visibility = _settings.DateFilter == 4 ? Visibility.Visible : Visibility.Collapsed;
+        AutoCheck.IsChecked = _settings.AutoStart;
         _loaded = true;
 
         _pollTimer.Tick += (_, _) => Poll();
         _copyTimer.Tick += (_, _) => RefreshCopyProgress();
         Loaded += (_, _) => { _pollTimer.Start(); Poll(); };
         Closing += OnClosing;
+        SetStage(Stage.NoDevice);
     }
-
-    // ------------------------------------------------------------ detection
 
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
+        var hwnd = new WindowInteropHelper(this).Handle;
+        // Graphite title bar with light text, matching the window (Windows 11; ignored elsewhere).
+        int on = 1, caption = 0x001C1617, text = 0x00F7F2F3;
+        DwmSetWindowAttribute(hwnd, 20, ref on, sizeof(int));
+        DwmSetWindowAttribute(hwnd, 35, ref caption, sizeof(int));
+        DwmSetWindowAttribute(hwnd, 36, ref text, sizeof(int));
         // Windows broadcasts WM_DEVICECHANGE when something is plugged in or removed: react right away.
         (PresentationSource.FromVisual(this) as HwndSource)?.AddHook((IntPtr _, int msg, IntPtr _, IntPtr _, ref bool _) =>
         {
@@ -65,9 +82,11 @@ public partial class MainWindow : Window
         });
     }
 
+    // ------------------------------------------------------------ detection
+
     private async void Poll()
     {
-        if (_polling) return;
+        if (_polling || _stage is Stage.Copying or Stage.Done) return;
         _polling = true;
         try
         {
@@ -75,80 +94,90 @@ public partial class MainWindow : Window
             {
                 if (_stage != Stage.NoDevice) return;
                 var folder = _demoFolder;
-                DeviceName.Text = "Demo folder";
+                _phone = new PhoneInfo("demo", "Demo folder", false);
+                DeviceName.Text = _phone.Name;
                 SetStage(Stage.Scanning);
                 _items = await Task.Run(() => PhoneService.ScanFolder(folder));
                 ShowLibrary();
                 await ReplanAsync();
+                return;
             }
-            else if (_stage is Stage.NoDevice or Stage.Locked)
+
+            // While a phone is being allowed, Windows reinstalls its driver and calls can hang:
+            // never let that block detection, just try again on the next tick.
+            var phones = await Task.Run(PhoneService.ListPhones).WaitAsync(TimeSpan.FromSeconds(15));
+            UpdatePhoneList(phones);
+
+            if (_stage is Stage.Ready or Stage.Scanning)
             {
-                var probe = Task.Run(() =>
+                if (!phones.Any(p => p.Id == _deviceId))
                 {
-                    var d = PhoneService.OpenPhone();
-                    if (d == null) return (false, "", "", (MediaDevice?)null);
-                    var displayName = PhoneService.DisplayName(d);
-                    var deviceId = d.DeviceId ?? "";
-                    if (PhoneService.HasMedia(d)) return (true, displayName, deviceId, d);
-                    d.Dispose();
-                    return (true, displayName, deviceId, null);
-                });
-
-                (bool found, string name, string id, MediaDevice? device) result;
-                try
-                {
-                    // While the phone is being allowed, Windows reinstalls its driver and a call can hang.
-                    // Never let that block detection: give up on this attempt and try again.
-                    result = await probe.WaitAsync(TimeSpan.FromSeconds(15));
-                }
-                catch (TimeoutException)
-                {
-                    Log.Write("Device probe timed out, retrying");
-                    _ = probe.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result.Item4?.Dispose(); });
-                    return;
-                }
-
-                var (found, name, id, device) = result;
-                if (_stage is not (Stage.NoDevice or Stage.Locked))
-                {
-                    device?.Dispose();
-                    return;
-                }
-
-                if (!found)
-                {
-                    if (_stage != Stage.NoDevice) Log.Write("iPhone gone");
-                    SetStage(Stage.NoDevice);
-                }
-                else if (device == null)
-                {
-                    if (_stage != Stage.Locked) Log.Write($"'{name}' connected but its photos are not readable yet (locked or not allowed)");
-                    DeviceName.Text = name;
-                    SetStage(Stage.Locked);
-                }
-                else
-                {
-                    Log.Write($"'{name}' readable, scanning");
-                    _device = device;
-                    _deviceId = id;
-                    DeviceName.Text = name;
-                    _ = ScanAsync();
-                }
-            }
-            else if (_stage is Stage.Ready or Stage.Scanning)
-            {
-                var id = _deviceId;
-                var present = await Task.Run(() => PhoneService.IsPresent(id)).WaitAsync(TimeSpan.FromSeconds(15));
-                if (!present && _stage is Stage.Ready or Stage.Scanning)
-                {
-                    Log.Write("iPhone unplugged");
+                    Log.Write($"'{_phone?.Name}' unplugged");
                     ResetToNoDevice();
                 }
+                return;
             }
+            if (_stage is Stage.Copying or Stage.Done) return;
+
+            var target = phones.FirstOrDefault(p => p.Id == _chosenId)
+                      ?? phones.FirstOrDefault(p => p.Id == _settings.LastDeviceId)
+                      ?? phones.FirstOrDefault();
+            if (target == null)
+            {
+                if (_stage != Stage.NoDevice) Log.Write("No phone connected");
+                _phone = null;
+                SetStage(Stage.NoDevice);
+                return;
+            }
+
+            var probe = Task.Run(() =>
+            {
+                var d = PhoneService.Open(target.Id);
+                if (d == null || PhoneService.HasMedia(d, target.IsApple)) return d;
+                d.Dispose();
+                return null;
+            });
+
+            MediaDevice? device;
+            try
+            {
+                device = await probe.WaitAsync(TimeSpan.FromSeconds(15));
+            }
+            catch (TimeoutException)
+            {
+                Log.Write("Device probe timed out, retrying");
+                _ = probe.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result?.Dispose(); });
+                return;
+            }
+
+            if (_stage is not (Stage.NoDevice or Stage.Locked))
+            {
+                device?.Dispose();
+                return;
+            }
+
+            _phone = target;
+            DeviceName.Text = target.Name;
+            if (device == null)
+            {
+                if (_stage != Stage.Locked) Log.Write($"'{target.Name}' connected but its photos are not readable yet");
+                SetStage(Stage.Locked);
+                return;
+            }
+
+            Log.Write($"'{target.Name}' readable (apple={target.IsApple}), scanning");
+            _device = device;
+            _deviceId = target.Id;
+            _settings.LastDeviceId = target.Id;
+            _settings.Save();
+            _ = ScanAsync();
+        }
+        catch (TimeoutException)
+        {
+            Log.Write("Device list timed out, retrying");
         }
         catch (Exception ex)
         {
-            // Detection is retried on the next tick.
             Log.Error("Poll", ex);
         }
         finally
@@ -157,14 +186,48 @@ public partial class MainWindow : Window
         }
     }
 
+    private void UpdatePhoneList(List<PhoneInfo> phones)
+    {
+        _phones = phones;
+        var several = phones.Count > 1;
+        DeviceChevron.Visibility = several ? Visibility.Visible : Visibility.Collapsed;
+        DevicePill.Tag = several ? "pick" : null;
+        DevicePill.ToolTip = several ? "Choose which phone to copy from" : null;
+    }
+
+    private void DevicePill_Click(object sender, RoutedEventArgs e)
+    {
+        if (_phones.Count < 2 || _stage == Stage.Copying) return;
+
+        var menu = new ContextMenu { PlacementTarget = DevicePill, Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom };
+        foreach (var phone in _phones)
+        {
+            var item = new MenuItem { Header = phone.Name, IsCheckable = true, IsChecked = phone.Id == _phone?.Id };
+            item.Click += (_, _) => SwitchTo(phone);
+            menu.Items.Add(item);
+        }
+        menu.IsOpen = true;
+    }
+
+    private void SwitchTo(PhoneInfo phone)
+    {
+        if (phone.Id == _phone?.Id || _stage == Stage.Copying) return;
+        Log.Write($"Switching to '{phone.Name}'");
+        _chosenId = phone.Id;
+        ResetToNoDevice();
+        Poll();
+    }
+
     private void DropDevice()
     {
         _scanCts?.Cancel();
         _planCts?.Cancel();
         var device = _device;
         _device = null;
+        _deviceId = "";
         _items = new List<MediaItem>();
         _plan = null;
+        _autoStarted = false;
         if (device != null) Task.Run(() => { try { device.Dispose(); } catch { } });
     }
 
@@ -182,6 +245,7 @@ public partial class MainWindow : Window
         _scanCts?.Cancel();
         var cts = _scanCts = new CancellationTokenSource();
         var device = _device!;
+        var isApple = _phone?.IsApple ?? false;
         IProgress<int> progress = new Progress<int>(n =>
         {
             if (_stage == Stage.Scanning) WaitText.Text = $"{n:N0} photos and videos found so far…";
@@ -189,7 +253,7 @@ public partial class MainWindow : Window
 
         try
         {
-            _items = await Task.Run(() => PhoneService.Scan(device, progress.Report, cts.Token));
+            _items = await Task.Run(() => PhoneService.Scan(device, isApple, progress.Report, cts.Token));
         }
         catch (OperationCanceledException)
         {
@@ -230,18 +294,28 @@ public partial class MainWindow : Window
 
     // ----------------------------------------------------------------- plan
 
+    private DateTime? SinceDate() => _settings.DateFilter switch
+    {
+        1 => DateTime.Today.AddDays(-7),
+        2 => DateTime.Today.AddDays(-30),
+        3 => DateTime.Today.AddYears(-1),
+        4 => _settings.Since?.Date,
+        _ => null,
+    };
+
+    /// <summary>The items the filters let through. Items without a known date are kept: better copied than missed.</summary>
+    private List<MediaItem> SelectedItems()
+    {
+        var since = SinceDate();
+        return _items.Where(i => (i.IsVideo ? _settings.IncludeVideos : _settings.IncludePhotos)
+                              && (since == null || i.Date == null || i.Date >= since)).ToList();
+    }
+
     private async Task ReplanAsync()
     {
         _planCts?.Cancel();
         _plan = null;
         StartButton.IsEnabled = false;
-
-        if (_items.Count == 0)
-        {
-            StartButton.Content = "Nothing to copy";
-            PlanText.Text = "No photos or videos were found. Make sure the iPhone is unlocked, then rescan.";
-            return;
-        }
 
         var destination = _settings.Destination;
         if (string.IsNullOrWhiteSpace(destination))
@@ -251,10 +325,26 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (!_settings.IncludePhotos && !_settings.IncludeVideos)
+        {
+            StartButton.Content = "Choose photos, videos or both";
+            PlanText.Text = "";
+            return;
+        }
+
+        var items = SelectedItems();
+        _selectedCount = items.Count;
+        var filtered = items.Count != _items.Count;
+        if (items.Count == 0)
+        {
+            StartButton.Content = "Nothing to copy";
+            PlanText.Text = "No photos or videos match these choices.";
+            return;
+        }
+
         StartButton.Content = "Checking the folder…";
         PlanText.Text = "";
         var cts = _planCts = new CancellationTokenSource();
-        var items = _items;
         var layout = _settings.Layout;
 
         CopyPlan plan;
@@ -277,22 +367,33 @@ public partial class MainWindow : Window
         if (cts.IsCancellationRequested || _stage != Stage.Ready) return;
         _plan = plan;
 
-        var skipped = plan.AlreadyCopied > 0 ? $"{plan.AlreadyCopied:N0} already in this folder will be skipped." : "";
+        var notes = new List<string>();
+        if (filtered) notes.Add($"{items.Count:N0} of {_items.Count:N0} items match your choices.");
+        if (plan.AlreadyCopied > 0 && plan.Jobs.Count > 0) notes.Add($"{plan.AlreadyCopied:N0} already in this folder will be skipped.");
+
         if (plan.Jobs.Count == 0)
         {
             StartButton.Content = "Nothing new to copy";
-            PlanText.Text = "Everything on the iPhone is already in this folder.";
+            notes.Add(filtered ? "All of them are already in this folder." : "Everything on the phone is already in this folder.");
         }
         else if (!plan.EnoughSpace)
         {
             StartButton.Content = "Not enough free space";
-            PlanText.Text = $"This copy needs {FormatSize(plan.Bytes)} but the drive only has {FormatSize(plan.FreeBytes)} free.";
+            notes.Add($"This copy needs {FormatSize(plan.Bytes)} but the drive only has {FormatSize(plan.FreeBytes)} free.");
         }
         else
         {
             StartButton.Content = $"Copy {plan.Jobs.Count:N0} {(plan.Jobs.Count == 1 ? "item" : "items")}  ·  {FormatSize(plan.Bytes)}";
             StartButton.IsEnabled = true;
-            PlanText.Text = skipped;
+        }
+        PlanText.Text = string.Join(" ", notes);
+
+        // Auto mode: once per connection, so "Back" after a copy does not start another one by itself.
+        if (_settings.AutoStart && !_autoStarted && StartButton.IsEnabled)
+        {
+            _autoStarted = true;
+            Log.Write("Auto-starting copy");
+            Start_Click(this, new RoutedEventArgs());
         }
     }
 
@@ -305,14 +406,27 @@ public partial class MainWindow : Window
         _settings.Destination = dialog.FolderName;
         _settings.Save();
         DestBox.Text = dialog.FolderName;
-        _ = ReplanAsync();
+        if (_stage == Stage.Ready) _ = ReplanAsync();
     }
 
-    private void Layout_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    /// <summary>Any of the options on the ready screen changed: remember it and recompute what will be copied.</summary>
+    private void Option_Changed(object sender, RoutedEventArgs e)
     {
-        if (!_loaded || LayoutBox.SelectedIndex < 0) return;
-        _settings.Layout = (FolderLayout)LayoutBox.SelectedIndex;
+        if (!_loaded) return;
+
+        _settings.Layout = (FolderLayout)Math.Max(0, LayoutBox.SelectedIndex);
+        _settings.IncludePhotos = PhotosCheck.IsChecked == true;
+        _settings.IncludeVideos = VideosCheck.IsChecked == true;
+        _settings.DateFilter = Math.Max(0, DateBox.SelectedIndex);
+        _settings.AutoStart = AutoCheck.IsChecked == true;
+
+        SinceRow.Visibility = _settings.DateFilter == 4 ? Visibility.Visible : Visibility.Collapsed;
+        if (_settings.DateFilter == 4 && SincePicker.SelectedDate == null) SincePicker.SelectedDate = DateTime.Today.AddMonths(-1);
+        _settings.Since = SincePicker.SelectedDate;
         _settings.Save();
+
+        // Ticking "automatic" is not a request to start right now.
+        if (ReferenceEquals(sender, AutoCheck)) _autoStarted = true;
         if (_stage == Stage.Ready) _ = ReplanAsync();
     }
 
@@ -406,7 +520,7 @@ public partial class MainWindow : Window
         var speed = (bytes - firstBytes) / seconds;
         if (speed < 1)
         {
-            CopySpeed.Text = "Waiting for the iPhone…";
+            CopySpeed.Text = "Waiting for the phone…";
             return;
         }
 
@@ -426,6 +540,7 @@ public partial class MainWindow : Window
         var copied = progress.FilesDone;
         var failed = progress.FilesFailed;
         var copiedText = copied == 1 ? "1 item was copied" : $"{copied:N0} items were copied";
+        var isApple = _phone?.IsApple ?? false;
         var problem = true;
 
         if (fatal != null)
@@ -435,8 +550,8 @@ public partial class MainWindow : Window
         }
         else if (progress.DeviceLost)
         {
-            DoneTitle.Text = "iPhone disconnected";
-            DoneText.Text = $"{copiedText} before the connection was lost. Plug the iPhone back in and start again: it continues where it stopped.";
+            DoneTitle.Text = "Phone disconnected";
+            DoneText.Text = $"{copiedText} before the connection was lost. Plug the phone back in and start again: it continues where it stopped.";
         }
         else if (canceled)
         {
@@ -446,7 +561,7 @@ public partial class MainWindow : Window
         else if (failed > 0)
         {
             DoneTitle.Text = "Finished with problems";
-            DoneText.Text = $"{copiedText}, but {failed:N0} could not be read from the iPhone.";
+            DoneText.Text = $"{copiedText}, but {failed:N0} could not be read from the phone.";
         }
         else
         {
@@ -456,15 +571,29 @@ public partial class MainWindow : Window
                 + (plan.AlreadyCopied > 0 ? $"\n{plan.AlreadyCopied:N0} were already there and were skipped." : "");
         }
 
-        DoneIcon.Text = problem ? "" : "";
+        DoneIcon.Text = problem ? "" : "";
+        DoneIcon.Foreground = (Brush)FindResource(problem ? "Amber" : "PurpleLight");
+        DoneBadge.Background = (Brush)FindResource(problem ? "AmberSoft" : "PurpleSoft");
 
         List<string> errors;
         lock (progress.Errors) errors = progress.Errors.ToList();
+        if (errors.Count > 0 || progress.DeviceLost)
+        {
+            DoneTip.Text = isApple
+                ? "Tip: on the iPhone, open Settings → Apps → Photos and set “Transfer to Mac or PC” to “Keep Originals”, "
+                  + "then keep the phone unlocked and run the copy again. Only the missing items will be copied."
+                : "Tip: keep the phone unlocked with “File transfer” selected for USB, then run the copy again. "
+                  + "Only the missing items will be copied.";
+            DoneTip.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            DoneTip.Visibility = Visibility.Collapsed;
+        }
+
+        ErrorsButton.Visibility = Visibility.Collapsed;
         if (errors.Count > 0)
         {
-            DoneTip.Text = "Tip: on the iPhone, open Settings → Apps → Photos and set “Transfer to Mac or PC” to “Keep Originals”, "
-                         + "then keep the phone unlocked and run the copy again. Only the missing items will be copied.";
-            DoneTip.Visibility = Visibility.Visible;
             try
             {
                 _errorLogPath = Path.Combine(Settings.AppDataDir, "last-errors.txt");
@@ -473,13 +602,8 @@ public partial class MainWindow : Window
             }
             catch
             {
-                ErrorsButton.Visibility = Visibility.Collapsed;
+                // No list to show; the summary above still says how many failed.
             }
-        }
-        else
-        {
-            DoneTip.Visibility = Visibility.Collapsed;
-            ErrorsButton.Visibility = Visibility.Collapsed;
         }
 
         SetStage(Stage.Done);
@@ -498,7 +622,8 @@ public partial class MainWindow : Window
     {
         if (_stage != Stage.Done) return;
         var id = _deviceId;
-        var present = _demoFolder != null || (_device != null && await Task.Run(() => PhoneService.IsPresent(id)));
+        var present = _demoFolder != null
+                   || (_device != null && await Task.Run(() => PhoneService.ListPhones().Any(p => p.Id == id)));
         if (_stage != Stage.Done) return;
 
         if (!present)
@@ -530,25 +655,29 @@ public partial class MainWindow : Window
             _ => TaskbarItemProgressState.None,
         };
 
+        var isApple = _phone?.IsApple ?? false;
         switch (stage)
         {
             case Stage.NoDevice:
-                DeviceName.Text = "No iPhone";
+                DeviceName.Text = "No phone";
                 DeviceDot.Fill = DotIdle;
                 WaitIcon.Text = "";
-                WaitTitle.Text = "Connect your iPhone";
-                WaitText.Text = "Plug it into this PC with a USB cable. It will be detected automatically.";
+                WaitTitle.Text = "Connect your phone";
+                WaitText.Text = "Plug your iPhone or Android phone into this PC with a USB cable. It will be detected automatically.\n"
+                              + "On Android, pick “File transfer” in the USB notification.";
                 break;
             case Stage.Locked:
                 DeviceDot.Fill = DotWaiting;
                 WaitIcon.Text = "";
-                WaitTitle.Text = "Unlock your iPhone";
-                WaitText.Text = "Unlock it and tap “Allow” (or “Trust”) when it asks whether this computer may access photos and videos. "
-                              + "This screen moves on by itself once the photos can be read.";
+                WaitTitle.Text = "Unlock your phone";
+                WaitText.Text = (isApple
+                        ? "Unlock the iPhone and tap “Allow” (or “Trust”) when it asks whether this computer may access photos and videos."
+                        : "Unlock the phone. If it asks what to use USB for, choose “File transfer” (sometimes “Transferring files / Android Auto”).")
+                    + " This screen moves on by itself once the photos can be read.";
                 break;
             case Stage.Scanning:
                 DeviceDot.Fill = DotOnline;
-                WaitIcon.Text = "";
+                WaitIcon.Text = "";
                 WaitTitle.Text = "Reading your library";
                 WaitText.Text = "Looking for photos and videos…";
                 break;
@@ -606,6 +735,9 @@ public partial class MainWindow : Window
 
     [DllImport("kernel32.dll")]
     private static extern uint SetThreadExecutionState(uint flags);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attribute, ref int value, int size);
 
     [DllImport("user32.dll")]
     private static extern bool FlashWindow(IntPtr hwnd, bool invert);

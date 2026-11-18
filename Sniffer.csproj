@@ -1,0 +1,36 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <NoWarn>$(NoWarn);WPF0001</NoWarn>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+
+    <AssemblyName>Sniffer</AssemblyName>
+    <RootNamespace>Sniffer</RootNamespace>
+    <ApplicationIcon>Assets\sniffer.ico</ApplicationIcon>
+    <Product>Sniffer</Product>
+    <AssemblyTitle>Sniffer</AssemblyTitle>
+    <Description>Copy photos and videos from an iPhone or Android phone to this PC</Description>
+    <Version>1.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="MediaDevices" Version="2.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\sniffer.ico" />
+    <Resource Include="Assets\sniffer.png" />
+  </ItemGroup>
+
+  <!-- The installer project lives next to the app; keep its output out of the app build. -->
+  <ItemGroup>
+    <Compile Remove="installer\**;dist\**" />
+    <None Remove="installer\**;dist\**" />
+  </ItemGroup>
+
+</Project>

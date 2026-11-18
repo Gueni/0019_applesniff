@@ -1,14 +1,19 @@
-﻿using System.IO;
+using System.IO;
 using MediaDevices;
 
-namespace AppleSniff;
+namespace Sniffer;
 
-/// <summary>One photo or video on the phone.</summary>
-public sealed record MediaItem(Func<Stream> Open, string Name, string PhoneFolder, long Size, DateTime? Date, bool IsVideo)
+/// <summary>One photo or video on the phone. <paramref name="Folder"/> is its path inside the storage, e.g. "DCIM/Camera".</summary>
+public sealed record MediaItem(Func<Stream> Open, string Name, string Storage, string Folder, long Size, DateTime? Date, bool IsVideo)
 {
     /// <summary>Identity that stays the same between sessions, used to remember what was already copied.</summary>
-    public string Key => $"{PhoneFolder}/{Name}|{Size}|{Date?.Ticks ?? 0}";
+    public string Key => $"{Storage}/{Folder}/{Name}|{Size}|{Date?.Ticks ?? 0}";
+
+    public string PhonePath => $"{Folder}/{Name}";
 }
+
+/// <summary>A connected phone (or camera) as seen before opening it.</summary>
+public sealed record PhoneInfo(string Id, string Name, bool IsApple);
 
 public sealed record CopyJob(MediaItem Item, string TargetPath);
 
@@ -35,14 +40,19 @@ public sealed class CopyProgress
 public static class PhoneService
 {
     private static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".mov", ".mp4", ".m4v", ".avi", ".3gp", ".mts" };
+        { ".mov", ".mp4", ".m4v", ".avi", ".3gp", ".3g2", ".mts", ".m2ts", ".mkv", ".webm", ".hevc" };
 
-    // Edit sidecars and other bookkeeping files that are useless outside the Photos app.
-    private static readonly HashSet<string> IgnoredExtensions = new(StringComparer.OrdinalIgnoreCase)
-        { ".aae", ".plist", ".xmp", ".db", ".ini" };
+    private static readonly HashSet<string> PhotoExtensions = new(StringComparer.OrdinalIgnoreCase)
+        { ".jpg", ".jpeg", ".heic", ".heif", ".hif", ".png", ".gif", ".webp", ".avif", ".dng", ".raw", ".tif", ".tiff", ".bmp" };
 
-    private const string IndexFileName = ".applesniff-index";
-    private const string PartSuffix = ".applesniff-part";
+    // On Android the photos live in these top-level folders; everything else (apps, music, LOST.DIR...) is skipped.
+    private static readonly HashSet<string> AndroidMediaRoots = new(StringComparer.OrdinalIgnoreCase)
+        { "DCIM", "Pictures", "Movies" };
+
+    private static bool IsMedia(string ext) => PhotoExtensions.Contains(ext) || VideoExtensions.Contains(ext);
+
+    private const string IndexFileName = ".sniffer-index";
+    private const string PartSuffix = ".sniffer-part";
 
     // ---------------------------------------------------------------- devices
 
@@ -61,20 +71,43 @@ public static class PhoneService
             || text.Contains("iPad", StringComparison.OrdinalIgnoreCase);
     }
 
-    public static string DisplayName(MediaDevice d)
+    private static string DisplayName(MediaDevice d)
     {
         var name = Safe(() => d.FriendlyName);
         if (name.Length == 0) name = Safe(() => d.Description);
-        return name.Length == 0 ? "iPhone" : name;
+        return name.Length == 0 ? "Phone" : name;
     }
 
-    /// <summary>Finds the first connected Apple device and opens it. Returns null when none is plugged in.</summary>
-    public static MediaDevice? OpenPhone()
+    /// <summary>
+    /// Phones and cameras plugged in over USB (MTP/PTP). USB sticks and card readers also show up as
+    /// portable devices, but through a software bus rather than a USB path, so they are left out.
+    /// </summary>
+    public static List<PhoneInfo> ListPhones()
+    {
+        var phones = new List<PhoneInfo>();
+        foreach (var d in AllDevices())
+        {
+            try
+            {
+                var id = Safe(() => d.DeviceId);
+                if (id.StartsWith(@"\\?\usb#", StringComparison.OrdinalIgnoreCase))
+                    phones.Add(new PhoneInfo(id, DisplayName(d), IsApple(d)));
+            }
+            finally
+            {
+                d.Dispose();
+            }
+        }
+        return phones;
+    }
+
+    /// <summary>Opens the device with this id. Returns null when it is gone or refuses the connection.</summary>
+    public static MediaDevice? Open(string deviceId)
     {
         MediaDevice? found = null;
         foreach (var d in AllDevices())
         {
-            if (found == null && IsApple(d)) found = d;
+            if (found == null && string.Equals(Safe(() => d.DeviceId), deviceId, StringComparison.OrdinalIgnoreCase)) found = d;
             else d.Dispose();
         }
         if (found == null) return null;
@@ -111,15 +144,21 @@ public static class PhoneService
     }
 
     /// <summary>
-    /// A locked or not-yet-allowed iPhone shows up with no storage, or with a storage whose DCIM
-    /// folder is missing or empty. Only once photo folders appear is the library really readable.
+    /// Whether the photos can be read yet. A locked Android phone, or one in "charging only" mode, shows
+    /// no storage at all. A locked or not-yet-allowed iPhone may show a storage whose DCIM folder is
+    /// missing or empty.
     /// </summary>
-    public static bool HasMedia(MediaDevice device)
+    public static bool HasMedia(MediaDevice device, bool isApple)
     {
         try
         {
             foreach (var storage in device.GetRootDirectory().EnumerateDirectories())
             {
+                if (!isApple)
+                {
+                    if (storage.EnumerateFileSystemInfos().Any()) return true;
+                    continue;
+                }
                 var dcim = storage.EnumerateDirectories().FirstOrDefault(d => string.Equals(d.Name, "DCIM", StringComparison.OrdinalIgnoreCase));
                 if (dcim != null && dcim.EnumerateFileSystemInfos().Any()) return true;
             }
@@ -134,37 +173,57 @@ public static class PhoneService
 
     // ------------------------------------------------------------------- scan
 
-    public static List<MediaItem> Scan(MediaDevice device, Action<int> onCount, CancellationToken ct)
+    /// <summary>Lists every photo and video on all of the phone's storages (internal memory, SD card...).</summary>
+    public static List<MediaItem> Scan(MediaDevice device, bool isApple, Action<int> onCount, CancellationToken ct)
     {
         var items = new List<MediaItem>();
-        var pending = new Stack<MediaDirectoryInfo>();
-        pending.Push(device.GetRootDirectory());
 
-        while (pending.Count > 0)
+        foreach (var storage in device.GetRootDirectory().EnumerateDirectories())
         {
             ct.ThrowIfCancellationRequested();
-            var dir = pending.Pop();
-            var folderName = dir.Name ?? "";
+            var storageName = storage.Name ?? "";
+            var pending = new Stack<(MediaDirectoryInfo Dir, string Path)>();
 
-            foreach (var entry in dir.EnumerateFileSystemInfos())
+            foreach (var top in storage.EnumerateDirectories())
+            {
+                var name = top.Name ?? "";
+                // An iPhone only exposes its camera roll; on other phones keep to the media folders.
+                if (isApple || AndroidMediaRoots.Contains(name)) pending.Push((top, name));
+            }
+
+            while (pending.Count > 0)
             {
                 ct.ThrowIfCancellationRequested();
-                if (entry is MediaDirectoryInfo sub)
-                {
-                    pending.Push(sub);
-                }
-                else if (entry is MediaFileInfo file)
-                {
-                    var name = file.Name;
-                    if (string.IsNullOrEmpty(name)) continue;
-                    var ext = Path.GetExtension(name);
-                    if (IgnoredExtensions.Contains(ext)) continue;
+                var (dir, path) = pending.Pop();
 
-                    DateTime? date = file.DateAuthored ?? file.CreationTime ?? file.LastWriteTime;
-                    if (date is { Year: < 1990 }) date = null;
+                foreach (var entry in dir.EnumerateFileSystemInfos())
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var name = entry.Name;
+                    // Hidden folders and files (.thumbnails, .trashed-..., .nomedia) are app caches, not photos.
+                    if (string.IsNullOrEmpty(name) || name.StartsWith('.')) continue;
 
-                    items.Add(new MediaItem(file.OpenRead, name, folderName, (long)file.Length, date, VideoExtensions.Contains(ext)));
-                    if (items.Count % 25 == 0) onCount(items.Count);
+                    if (entry is MediaDirectoryInfo sub)
+                    {
+                        pending.Push((sub, $"{path}/{name}"));
+                    }
+                    else if (entry is MediaFileInfo file)
+                    {
+                        var ext = Path.GetExtension(name);
+                        if (!IsMedia(ext)) continue;
+
+                        // Capture date first; else the date most cameras and apps put in the name
+                        // (20260927_123658.jpg, IMG-20260912-WA0004.jpeg); the file dates on Android change
+                        // whenever a file is moved, so they come last.
+                        var fileDate = Plausible(file.CreationTime) ?? Plausible(file.LastWriteTime);
+                        var nameDate = DateFromName(name);
+                        // A name with only a day (IMG-20260912-WA0004) borrows the time from the file when they agree on the day.
+                        if (nameDate is { TimeOfDay.Ticks: 0 } && fileDate?.Date == nameDate) nameDate = fileDate;
+                        DateTime? date = Plausible(file.DateAuthored) ?? nameDate ?? fileDate;
+
+                        items.Add(new MediaItem(file.OpenRead, name, storageName, path, (long)file.Length, date, VideoExtensions.Contains(ext)));
+                        if (items.Count % 25 == 0) onCount(items.Count);
+                    }
                 }
             }
         }
@@ -173,8 +232,32 @@ public static class PhoneService
         return items;
     }
 
+    private static DateTime? Plausible(DateTime? d) => d is { Year: >= 1990 } && d.Value <= DateTime.Now.AddDays(2) ? d : null;
+
+    private static readonly System.Text.RegularExpressions.Regex NameDate = new(
+        // Must start the name, follow a separator, or follow a camera prefix (IMG20230101...), so that
+        // digits inside hashes like file_00000000a9b0820251231 are not mistaken for dates.
+        @"(?<=^|[^0-9A-Za-z]|IMG|VID|PXL|MVIMG)((?:19|20)\d{2})[-_.]?(\d{2})[-_.]?(\d{2})(?:[-_ T.]?(\d{2})[-_.]?(\d{2})[-_.]?(\d{2}))?(?!\d{3})",
+        System.Text.RegularExpressions.RegexOptions.Compiled);
+
+    /// <summary>Reads dates like 20260927_123658, 2026-09-27 12.36.58 or IMG-20260912-WA0004 from a file name.</summary>
+    public static DateTime? DateFromName(string name)
+    {
+        var m = NameDate.Match(name);
+        if (!m.Success) return null;
+        int y = int.Parse(m.Groups[1].Value), mo = int.Parse(m.Groups[2].Value), d = int.Parse(m.Groups[3].Value);
+        if (mo is < 1 or > 12 || d < 1 || d > DateTime.DaysInMonth(y, mo)) return null;
+        var date = new DateTime(y, mo, d);
+        if (m.Groups[4].Success)
+        {
+            int h = int.Parse(m.Groups[4].Value), mi = int.Parse(m.Groups[5].Value), s = int.Parse(m.Groups[6].Value);
+            if (h < 24 && mi < 60 && s < 60) date = date.Add(new TimeSpan(h, mi, s));
+        }
+        return Plausible(date);
+    }
+
     /// <summary>
-    /// Stand-in for a phone, used to try the app without one: set the APPLESNIFF_DEMO environment
+    /// Stand-in for a phone, used to try the app without one: set the SNIFFER_DEMO environment
     /// variable to a folder and its files are treated as the phone's library.
     /// </summary>
     public static List<MediaItem> ScanFolder(string folder)
@@ -182,9 +265,10 @@ public static class PhoneService
         var items = new List<MediaItem>();
         foreach (var f in new DirectoryInfo(folder).EnumerateFiles("*", SearchOption.AllDirectories))
         {
-            if (IgnoredExtensions.Contains(f.Extension)) continue;
+            if (!IsMedia(f.Extension)) continue;
             var path = f.FullName;
-            items.Add(new MediaItem(() => File.OpenRead(path), f.Name, f.Directory?.Name ?? "", f.Length, f.LastWriteTime,
+            var rel = Path.GetRelativePath(folder, f.DirectoryName!).Replace('\\', '/');
+            items.Add(new MediaItem(() => File.OpenRead(path), f.Name, "Demo", rel, f.Length, f.LastWriteTime,
                 VideoExtensions.Contains(f.Extension)));
         }
         return items;
@@ -201,7 +285,7 @@ public static class PhoneService
     private static string RelativeDir(MediaItem item, FolderLayout layout) => layout switch
     {
         FolderLayout.ByMonth => item.Date is { } d ? Path.Combine(d.ToString("yyyy"), d.ToString("yyyy-MM")) : "Unknown date",
-        FolderLayout.PhoneFolders => CleanName(item.PhoneFolder),
+        FolderLayout.PhoneFolders => Path.Combine(item.Folder.Split('/', StringSplitOptions.RemoveEmptyEntries).Select(CleanName).ToArray()),
         _ => "",
     };
 
@@ -369,7 +453,7 @@ public static class PhoneService
             else
             {
                 Interlocked.Increment(ref progress.FilesFailed);
-                lock (progress.Errors) progress.Errors.Add($"{item.PhoneFolder}/{item.Name}: {error.Message}");
+                lock (progress.Errors) progress.Errors.Add($"{item.PhonePath}: {error.Message}");
 
                 // A run of failures usually means the cable was pulled or the phone locked itself out.
                 if (++consecutiveFailures >= 3 && !IsPresent(deviceId))
