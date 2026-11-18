@@ -83,17 +83,32 @@ public partial class MainWindow : Window
             }
             else if (_stage is Stage.NoDevice or Stage.Locked)
             {
-                var (found, name, id, device) = await Task.Run(() =>
+                var probe = Task.Run(() =>
                 {
                     var d = PhoneService.OpenPhone();
                     if (d == null) return (false, "", "", (MediaDevice?)null);
                     var displayName = PhoneService.DisplayName(d);
                     var deviceId = d.DeviceId ?? "";
-                    if (PhoneService.HasStorage(d)) return (true, displayName, deviceId, d);
+                    if (PhoneService.HasMedia(d)) return (true, displayName, deviceId, d);
                     d.Dispose();
                     return (true, displayName, deviceId, null);
                 });
 
+                (bool found, string name, string id, MediaDevice? device) result;
+                try
+                {
+                    // While the phone is being allowed, Windows reinstalls its driver and a call can hang.
+                    // Never let that block detection: give up on this attempt and try again.
+                    result = await probe.WaitAsync(TimeSpan.FromSeconds(15));
+                }
+                catch (TimeoutException)
+                {
+                    Log.Write("Device probe timed out, retrying");
+                    _ = probe.ContinueWith(t => { if (t.IsCompletedSuccessfully) t.Result.Item4?.Dispose(); });
+                    return;
+                }
+
+                var (found, name, id, device) = result;
                 if (_stage is not (Stage.NoDevice or Stage.Locked))
                 {
                     device?.Dispose();
@@ -102,31 +117,39 @@ public partial class MainWindow : Window
 
                 if (!found)
                 {
+                    if (_stage != Stage.NoDevice) Log.Write("iPhone gone");
                     SetStage(Stage.NoDevice);
                 }
                 else if (device == null)
                 {
+                    if (_stage != Stage.Locked) Log.Write($"'{name}' connected but its photos are not readable yet (locked or not allowed)");
                     DeviceName.Text = name;
                     SetStage(Stage.Locked);
                 }
                 else
                 {
+                    Log.Write($"'{name}' readable, scanning");
                     _device = device;
                     _deviceId = id;
                     DeviceName.Text = name;
                     _ = ScanAsync();
                 }
             }
-            else if (_stage == Stage.Ready)
+            else if (_stage is Stage.Ready or Stage.Scanning)
             {
                 var id = _deviceId;
-                var present = await Task.Run(() => PhoneService.IsPresent(id));
-                if (!present && _stage == Stage.Ready) ResetToNoDevice();
+                var present = await Task.Run(() => PhoneService.IsPresent(id)).WaitAsync(TimeSpan.FromSeconds(15));
+                if (!present && _stage is Stage.Ready or Stage.Scanning)
+                {
+                    Log.Write("iPhone unplugged");
+                    ResetToNoDevice();
+                }
             }
         }
-        catch
+        catch (Exception ex)
         {
             // Detection is retried on the next tick.
+            Log.Error("Poll", ex);
         }
         finally
         {
@@ -172,16 +195,26 @@ public partial class MainWindow : Window
         {
             return;
         }
-        catch
+        catch (Exception ex)
         {
             // Usually the phone locked or was unplugged mid-scan: start over once it is readable again.
             if (cts.IsCancellationRequested) return;
+            Log.Error("Scan", ex);
             DropDevice();
             SetStage(Stage.Locked);
             return;
         }
 
         if (cts.IsCancellationRequested) return;
+
+        Log.Write($"Scan done: {_items.Count} items, {FormatSize(_items.Sum(i => i.Size))}");
+        if (_items.Count == 0)
+        {
+            // Nothing visible almost always means the phone has not fully granted access yet: keep waiting.
+            DropDevice();
+            SetStage(Stage.Locked);
+            return;
+        }
 
         ShowLibrary();
         await ReplanAsync();
@@ -309,6 +342,7 @@ public partial class MainWindow : Window
         _copyTimer.Start();
         SetThreadExecutionState(EsContinuous | EsSystemRequired);
 
+        Log.Write($"Copy started: {plan.Jobs.Count} items, {FormatSize(plan.Bytes)} -> {destination} ({_settings.Layout})");
         var canceled = false;
         string? fatal = null;
         try
@@ -328,6 +362,9 @@ public partial class MainWindow : Window
             SetThreadExecutionState(EsContinuous);
             _copyTimer.Stop();
         }
+
+        Log.Write($"Copy ended: copied={progress.FilesDone} failed={progress.FilesFailed} canceled={canceled} deviceLost={progress.DeviceLost} fatal={fatal ?? "-"}");
+        lock (progress.Errors) foreach (var err in progress.Errors.Take(50)) Log.Write("  failed: " + err);
 
         if (_closeWhenDone)
         {
@@ -485,6 +522,7 @@ public partial class MainWindow : Window
         PanelCopy.Visibility = stage == Stage.Copying ? Visibility.Visible : Visibility.Collapsed;
         PanelDone.Visibility = stage == Stage.Done ? Visibility.Visible : Visibility.Collapsed;
         WaitBar.Visibility = stage == Stage.Scanning ? Visibility.Visible : Visibility.Collapsed;
+        RetryButton.Visibility = stage == Stage.Locked ? Visibility.Visible : Visibility.Collapsed;
         Taskbar.ProgressState = stage switch
         {
             Stage.Scanning => TaskbarItemProgressState.Indeterminate,
@@ -505,7 +543,8 @@ public partial class MainWindow : Window
                 DeviceDot.Fill = DotWaiting;
                 WaitIcon.Text = "";
                 WaitTitle.Text = "Unlock your iPhone";
-                WaitText.Text = "Unlock it and tap “Allow” (or “Trust”) when it asks whether this computer may access photos and videos.";
+                WaitText.Text = "Unlock it and tap “Allow” (or “Trust”) when it asks whether this computer may access photos and videos. "
+                              + "This screen moves on by itself once the photos can be read.";
                 break;
             case Stage.Scanning:
                 DeviceDot.Fill = DotOnline;

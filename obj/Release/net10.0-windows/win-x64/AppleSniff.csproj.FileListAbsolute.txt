@@ -21,3 +21,4 @@ D:\WORKSPACE\0019_applesniff\obj\Release\net10.0-windows\win-x64\refint\AppleSni
 D:\WORKSPACE\0019_applesniff\obj\Release\net10.0-windows\win-x64\AppleSniff.pdb
 D:\WORKSPACE\0019_applesniff\obj\Release\net10.0-windows\win-x64\AppleSniff.genruntimeconfig.cache
 D:\WORKSPACE\0019_applesniff\obj\Release\net10.0-windows\win-x64\ref\AppleSniff.dll
+D:\WORKSPACE\0019_applesniff\obj\Release\net10.0-windows\win-x64\AppleSniff.sourcelink.json

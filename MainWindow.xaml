@@ -41,6 +41,8 @@
             <TextBlock x:Name="WaitText" Style="{StaticResource Muted}" TextAlignment="Center" HorizontalAlignment="Center" MaxWidth="380"
                        Text="Plug it into this PC with a USB cable. It will be detected automatically." />
             <ProgressBar x:Name="WaitBar" IsIndeterminate="True" Width="220" Margin="0,24,0,0" Visibility="Collapsed" />
+            <Button x:Name="RetryButton" Content="Try again" HorizontalAlignment="Center" Margin="0,24,0,0" Padding="18,6"
+                    Visibility="Collapsed" Click="Rescan_Click" />
         </StackPanel>
 
         <!-- Ready: summary, destination, start -->

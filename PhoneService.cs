@@ -84,8 +84,9 @@ public static class PhoneService
             found.Connect(MediaDeviceAccess.GenericRead);
             return found;
         }
-        catch
+        catch (Exception ex)
         {
+            Log.Error("Connect", ex);
             found.Dispose();
             return null;
         }
@@ -109,15 +110,24 @@ public static class PhoneService
         return present;
     }
 
-    /// <summary>A locked or not-yet-trusted iPhone shows up as a device with no storage inside.</summary>
-    public static bool HasStorage(MediaDevice device)
+    /// <summary>
+    /// A locked or not-yet-allowed iPhone shows up with no storage, or with a storage whose DCIM
+    /// folder is missing or empty. Only once photo folders appear is the library really readable.
+    /// </summary>
+    public static bool HasMedia(MediaDevice device)
     {
         try
         {
-            return device.GetRootDirectory().EnumerateDirectories().Any();
+            foreach (var storage in device.GetRootDirectory().EnumerateDirectories())
+            {
+                var dcim = storage.EnumerateDirectories().FirstOrDefault(d => string.Equals(d.Name, "DCIM", StringComparison.OrdinalIgnoreCase));
+                if (dcim != null && dcim.EnumerateFileSystemInfos().Any()) return true;
+            }
+            return false;
         }
-        catch
+        catch (Exception ex)
         {
+            Log.Error("HasMedia", ex);
             return false;
         }
     }
