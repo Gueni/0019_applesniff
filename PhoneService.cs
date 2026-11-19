@@ -17,6 +17,38 @@ public sealed record PhoneInfo(string Id, string Name, bool IsApple);
 
 public sealed record CopyJob(MediaItem Item, string TargetPath);
 
+/// <summary>A PC file to send to the phone. <paramref name="RelativePath"/> uses '\' and is kept under the phone folder.</summary>
+public sealed record SendJob(string Source, string RelativePath, long Size);
+
+/// <summary>Passes reads through while counting bytes, so a single large upload can report progress and be canceled.</summary>
+internal sealed class ProgressStream(Stream inner, Action<long> onRead, CancellationToken ct) : Stream
+{
+    public override bool CanRead => true;
+    public override bool CanSeek => inner.CanSeek;
+    public override bool CanWrite => false;
+    public override long Length => inner.Length;
+    public override long Position { get => inner.Position; set => inner.Position = value; }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ct.ThrowIfCancellationRequested();
+        var n = inner.Read(buffer, offset, count);
+        if (n > 0) onRead(n);
+        return n;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin) => inner.Seek(offset, origin);
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) inner.Dispose();
+        base.Dispose(disposing);
+    }
+}
+
 public sealed class CopyPlan
 {
     public List<CopyJob> Jobs { get; } = new();
@@ -32,6 +64,7 @@ public sealed class CopyProgress
     public long BytesDone;
     public int FilesDone;
     public int FilesFailed;
+    public int FilesSkipped;
     public volatile string CurrentName = "";
     public volatile bool DeviceLost;
     public List<string> Errors { get; } = new();
@@ -510,6 +543,196 @@ public static class PhoneService
         {
             try { File.Delete(part); } catch { }
             throw;
+        }
+    }
+
+    // ------------------------------------------------------- send to phone
+
+    /// <summary>Folder on the phone's main storage that sent files go into; Android's Files app shows it as "Downloads".</summary>
+    public const string SendFolder = "Download";
+
+    /// <summary>Expands picked or dropped files and folders into a flat list; a folder keeps its own name and inner structure.</summary>
+    public static List<SendJob> CollectFiles(IEnumerable<string> paths)
+    {
+        var jobs = new List<SendJob>();
+        foreach (var path in paths)
+        {
+            if (File.Exists(path))
+            {
+                jobs.Add(new SendJob(path, CleanName(Path.GetFileName(path)), new FileInfo(path).Length));
+            }
+            else if (Directory.Exists(path))
+            {
+                var parent = Path.GetDirectoryName(Path.TrimEndingDirectorySeparator(path)) ?? path;
+                foreach (var f in new DirectoryInfo(path).EnumerateFiles("*", new EnumerationOptions { RecurseSubdirectories = true, AttributesToSkip = FileAttributes.Hidden | FileAttributes.System }))
+                {
+                    var rel = Path.GetRelativePath(parent, f.FullName);
+                    jobs.Add(new SendJob(f.FullName, string.Join('\\', rel.Split(Path.DirectorySeparatorChar).Select(CleanName)), f.Length));
+                }
+            }
+        }
+        return jobs;
+    }
+
+    /// <summary>
+    /// Copies PC files into <see cref="SendFolder"/> on the phone's first storage. MTP carries one transfer at a time,
+    /// so speed comes from streaming each file in one go with large reads and from not re-sending what is already there.
+    /// Returns the phone folder the files went to.
+    /// </summary>
+    public static string Send(string deviceId, IReadOnlyList<SendJob> jobs, CopyProgress progress, CancellationToken ct)
+    {
+        using var device = OpenForWrite(deviceId)
+            ?? throw new IOException("The phone can't be opened. Unlock it and choose “File transfer” for USB.");
+        var storage = device.GetRootDirectory().EnumerateDirectories().FirstOrDefault()
+            ?? throw new IOException("The phone shows no storage. Unlock it and try again.");
+        var storageName = storage.Name ?? "phone";
+        var root = storage.FullName.TrimEnd('\\') + '\\' + SendFolder;
+
+        try
+        {
+            var needed = jobs.Sum(j => j.Size);
+            var drive = device.GetDrives()?.FirstOrDefault(d => string.Equals(d.RootDirectory?.FullName?.TrimEnd('\\'), storage.FullName.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase));
+            if (drive != null && drive.AvailableFreeSpace > 0 && (long)drive.AvailableFreeSpace < needed)
+                throw new IOException($"The phone needs {needed / (1 << 20):N0} MB free but only has {(long)drive.AvailableFreeSpace / (1 << 20):N0} MB.");
+        }
+        catch (IOException) { throw; }
+        catch
+        {
+            // Free space unknown: try anyway, a full phone reports the error per file.
+        }
+
+        // One listing per phone folder: far cheaper over MTP than asking about each file.
+        var listings = new Dictionary<string, Dictionary<string, long>?>(StringComparer.OrdinalIgnoreCase);
+        Dictionary<string, long>? Listing(string dir)
+        {
+            if (listings.TryGetValue(dir, out var known)) return known;
+            Dictionary<string, long>? files = null;
+            if (device.DirectoryExists(dir))
+            {
+                files = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                foreach (var e in device.GetDirectoryInfo(dir).EnumerateFileSystemInfos())
+                    if (e is MediaFileInfo f && f.Name is { } n) files[n] = (long)f.Length;
+            }
+            return listings[dir] = files;
+        }
+
+        var buffer = 1 << 22;   // 4 MB reads from the PC disk keep the USB pipe full
+        long completedBytes = 0;
+        var consecutiveFailures = 0;
+
+        foreach (var job in jobs)
+        {
+            ct.ThrowIfCancellationRequested();
+            progress.CurrentName = job.RelativePath;
+
+            var full = root + '\\' + job.RelativePath;
+            var dir = full[..full.LastIndexOf('\\')];
+            var name = full[(dir.Length + 1)..];
+            var stem = Path.GetFileNameWithoutExtension(name);
+            var ext = Path.GetExtension(name);
+
+            Exception? error = null;
+            var skipped = false;
+            for (var attempt = 1; attempt <= 2; attempt++)
+            {
+                string? target = null;
+                try
+                {
+                    var existing = Listing(dir);
+                    for (var n = 1; n < 10_000 && target == null && !skipped; n++)
+                    {
+                        var candidate = n == 1 ? name : $"{stem} ({n}){ext}";
+                        if (existing != null && existing.TryGetValue(candidate, out var length))
+                        {
+                            if (length == job.Size) skipped = true;   // already on the phone
+                            continue;
+                        }
+                        target = dir + '\\' + candidate;
+                    }
+                    if (skipped || target == null) { skipped = true; break; }
+
+                    if (existing == null)
+                    {
+                        device.CreateDirectory(dir);
+                        listings[dir] = existing = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+                    }
+
+                    long read = 0;
+                    using (var source = new ProgressStream(
+                               new FileStream(job.Source, FileMode.Open, FileAccess.Read, FileShare.Read, buffer, FileOptions.SequentialScan),
+                               n =>
+                               {
+                                   read += n;
+                                   Interlocked.Exchange(ref progress.BytesDone, completedBytes + Math.Min(read, job.Size));
+                               }, ct))
+                    {
+                        device.UploadFile(source, target);
+                    }
+
+                    existing[target[(dir.Length + 1)..]] = job.Size;
+                    error = null;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    // Never leave a half-written file on the phone: it would look complete in the gallery.
+                    if (target != null) try { if (device.FileExists(target)) device.DeleteFile(target); } catch { }
+                    if (ex is OperationCanceledException) throw;
+                    error = ex;
+                    listings.Remove(dir);
+                    Interlocked.Exchange(ref progress.BytesDone, completedBytes);
+                    if (attempt == 1) Thread.Sleep(600);
+                }
+            }
+
+            completedBytes += job.Size;
+            Interlocked.Exchange(ref progress.BytesDone, completedBytes);
+
+            if (skipped)
+            {
+                Interlocked.Increment(ref progress.FilesSkipped);
+            }
+            else if (error == null)
+            {
+                consecutiveFailures = 0;
+                Interlocked.Increment(ref progress.FilesDone);
+            }
+            else
+            {
+                Interlocked.Increment(ref progress.FilesFailed);
+                lock (progress.Errors) progress.Errors.Add($"{job.Source}: {error.Message}");
+                if (++consecutiveFailures >= 3 && !IsPresent(deviceId))
+                {
+                    progress.DeviceLost = true;
+                    break;
+                }
+            }
+        }
+
+        return $"{storageName}\\{SendFolder}";
+    }
+
+    /// <summary>A second, writable connection; the one used for reading stays read-only.</summary>
+    private static MediaDevice? OpenForWrite(string deviceId)
+    {
+        MediaDevice? found = null;
+        foreach (var d in AllDevices())
+        {
+            if (found == null && string.Equals(Safe(() => d.DeviceId), deviceId, StringComparison.OrdinalIgnoreCase)) found = d;
+            else d.Dispose();
+        }
+        if (found == null) return null;
+
+        try
+        {
+            found.Connect(MediaDeviceAccess.GenericRead | MediaDeviceAccess.GenericWrite);
+            return found;
+        }
+        catch (Exception ex)
+        {
+            Log.Error("Connect for write", ex);
+            found.Dispose();
+            return null;
         }
     }
 }

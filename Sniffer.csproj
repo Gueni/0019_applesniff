@@ -15,7 +15,7 @@
     <Product>Sniffer</Product>
     <AssemblyTitle>Sniffer</AssemblyTitle>
     <Description>Copy photos and videos from an iPhone or Android phone to this PC</Description>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
   </PropertyGroup>
 
   <ItemGroup>

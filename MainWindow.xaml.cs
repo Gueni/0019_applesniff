@@ -13,7 +13,8 @@ namespace Sniffer;
 
 public partial class MainWindow : Window
 {
-    private enum Stage { NoDevice, Locked, Scanning, Ready, Copying, Done }
+    /// <summary>Connected: the phone is readable but its library has not been scanned (scanning only starts when asked).</summary>
+    private enum Stage { NoDevice, Locked, Connected, Scanning, Ready, Copying, Done }
 
     private static readonly Brush DotIdle = new SolidColorBrush(Color.FromRgb(0x6E, 0x6A, 0x7E));
     private static readonly Brush DotWaiting = new SolidColorBrush(Color.FromRgb(0xF5, 0xB8, 0x41));
@@ -41,8 +42,12 @@ public partial class MainWindow : Window
     private CancellationTokenSource? _copyCts;
     private bool _polling;
     private bool _autoStarted;
+    private bool _scanRequested;        // the user asked to scan: do it as soon as the phone is readable
     private bool _closeWhenDone;
     private string _errorLogPath = "";
+    private bool _sending;              // the running transfer goes PC -> phone rather than phone -> PC
+    private int _runFiles;              // totals of the running transfer, for the progress screen
+    private long _runBytes;
 
     public MainWindow()
     {
@@ -96,6 +101,12 @@ public partial class MainWindow : Window
                 var folder = _demoFolder;
                 _phone = new PhoneInfo("demo", "Demo folder", false);
                 DeviceName.Text = _phone.Name;
+                if (!_scanRequested && !_settings.AutoStart)
+                {
+                    SetStage(Stage.Connected);
+                    return;
+                }
+                _scanRequested = false;
                 SetStage(Stage.Scanning);
                 _items = await Task.Run(() => PhoneService.ScanFolder(folder));
                 ShowLibrary();
@@ -108,7 +119,7 @@ public partial class MainWindow : Window
             var phones = await Task.Run(PhoneService.ListPhones).WaitAsync(TimeSpan.FromSeconds(15));
             UpdatePhoneList(phones);
 
-            if (_stage is Stage.Ready or Stage.Scanning)
+            if (_stage is Stage.Ready or Stage.Scanning or Stage.Connected)
             {
                 if (!phones.Any(p => p.Id == _deviceId))
                 {
@@ -165,12 +176,22 @@ public partial class MainWindow : Window
                 return;
             }
 
-            Log.Write($"'{target.Name}' readable (apple={target.IsApple}), scanning");
             _device = device;
             _deviceId = target.Id;
             _settings.LastDeviceId = target.Id;
             _settings.Save();
-            _ = ScanAsync();
+
+            // Only read the library when the user asked for it (or opted into automatic copying).
+            if (_scanRequested || _settings.AutoStart)
+            {
+                Log.Write($"'{target.Name}' readable (apple={target.IsApple}), scanning");
+                _ = ScanAsync();
+            }
+            else
+            {
+                Log.Write($"'{target.Name}' readable (apple={target.IsApple}), waiting for the user to scan");
+                SetStage(Stage.Connected);
+            }
         }
         catch (TimeoutException)
         {
@@ -234,6 +255,8 @@ public partial class MainWindow : Window
     private void ResetToNoDevice()
     {
         DropDevice();
+        // A scan the user asked for survives the phone locking mid-scan (DropDevice alone), not a new connection.
+        _scanRequested = false;
         SetStage(Stage.NoDevice);
     }
 
@@ -271,6 +294,7 @@ public partial class MainWindow : Window
 
         if (cts.IsCancellationRequested) return;
 
+        _scanRequested = false;
         Log.Write($"Scan done: {_items.Count} items, {FormatSize(_items.Sum(i => i.Size))}");
         if (_items.Count == 0)
         {
@@ -434,6 +458,7 @@ public partial class MainWindow : Window
     {
         // Reopen the phone from scratch so the new scan sees photos taken since the last one.
         ResetToNoDevice();
+        _scanRequested = true;
         Poll();
     }
 
@@ -448,6 +473,9 @@ public partial class MainWindow : Window
         var cts = _copyCts = new CancellationTokenSource();
         var progress = _progress = new CopyProgress();
         var deviceId = _deviceId;
+        _sending = false;
+        _runFiles = plan.Jobs.Count;
+        _runBytes = plan.Bytes;
         _speedSamples.Clear();
         CancelButton.IsEnabled = true;
         CancelButton.Content = "Cancel";
@@ -491,17 +519,16 @@ public partial class MainWindow : Window
 
     private void RefreshCopyProgress()
     {
-        var plan = _plan;
         var progress = _progress;
-        if (plan == null || progress == null) return;
+        if (progress == null) return;
 
         var bytes = Interlocked.Read(ref progress.BytesDone);
-        var fraction = plan.Bytes > 0 ? Math.Clamp((double)bytes / plan.Bytes, 0, 1) : 0;
-        var handled = progress.FilesDone + progress.FilesFailed;
+        var fraction = _runBytes > 0 ? Math.Clamp((double)bytes / _runBytes, 0, 1) : 0;
+        var handled = progress.FilesDone + progress.FilesFailed + progress.FilesSkipped;
 
         CopyBar.Value = fraction;
         CopyPercent.Text = $"{Math.Floor(fraction * 100):0}%";
-        CopyCounts.Text = $"{handled:N0} of {plan.Jobs.Count:N0} items  ·  {FormatSize(bytes)} of {FormatSize(plan.Bytes)}";
+        CopyCounts.Text = $"{handled:N0} of {_runFiles:N0} {(_sending ? "files sent" : "items")}  ·  {FormatSize(bytes)} of {FormatSize(_runBytes)}";
         CopyFile.Text = progress.CurrentName;
         Taskbar.ProgressValue = fraction;
 
@@ -524,7 +551,7 @@ public partial class MainWindow : Window
             return;
         }
 
-        var remaining = TimeSpan.FromSeconds((plan.Bytes - bytes) / speed);
+        var remaining = TimeSpan.FromSeconds((_runBytes - bytes) / speed);
         CopySpeed.Text = $"{FormatSize((long)speed)}/s  ·  {FormatDuration(remaining)} left";
     }
 
@@ -591,6 +618,15 @@ public partial class MainWindow : Window
             DoneTip.Visibility = Visibility.Collapsed;
         }
 
+        OpenFolderButton.Visibility = Visibility.Visible;
+        ShowErrors(errors);
+        SetStage(Stage.Done);
+        Taskbar.ProgressState = problem ? TaskbarItemProgressState.Error : TaskbarItemProgressState.None;
+        if (!IsActive) FlashWindow(new WindowInteropHelper(this).Handle, true);
+    }
+
+    private void ShowErrors(List<string> errors)
+    {
         ErrorsButton.Visibility = Visibility.Collapsed;
         if (errors.Count > 0)
         {
@@ -605,7 +641,131 @@ public partial class MainWindow : Window
                 // No list to show; the summary above still says how many failed.
             }
         }
+    }
 
+    // ------------------------------------------------------- send to phone
+
+    private bool CanSend => _stage is Stage.Ready or Stage.Connected && _demoFolder == null && _phone is { IsApple: false } && _deviceId.Length > 0;
+
+    private void Send_Click(object sender, RoutedEventArgs e)
+    {
+        if (!CanSend) return;
+        var dialog = new Microsoft.Win32.OpenFileDialog { Title = "Choose files to send to the phone", Multiselect = true };
+        if (dialog.ShowDialog(this) == true) _ = SendAsync(dialog.FileNames);
+    }
+
+    private void Window_DragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = CanSend && e.Data.GetDataPresent(DataFormats.FileDrop) ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
+    }
+
+    private void Window_Drop(object sender, DragEventArgs e)
+    {
+        if (CanSend && e.Data.GetData(DataFormats.FileDrop) is string[] paths && paths.Length > 0) _ = SendAsync(paths);
+    }
+
+    private async Task SendAsync(string[] paths)
+    {
+        if (!CanSend) return;
+        List<SendJob> jobs;
+        try
+        {
+            jobs = await Task.Run(() => PhoneService.CollectFiles(paths));
+        }
+        catch (Exception ex)
+        {
+            PlanText.Text = "Those files can't be read: " + ex.Message;
+            return;
+        }
+        if (jobs.Count == 0 || !CanSend) return;
+
+        var cts = _copyCts = new CancellationTokenSource();
+        var progress = _progress = new CopyProgress();
+        var deviceId = _deviceId;
+        _sending = true;
+        _runFiles = jobs.Count;
+        _runBytes = jobs.Sum(j => j.Size);
+        _speedSamples.Clear();
+        CancelButton.IsEnabled = true;
+        CancelButton.Content = "Cancel";
+        SetStage(Stage.Copying);
+        RefreshCopyProgress();
+        _copyTimer.Start();
+        SetThreadExecutionState(EsContinuous | EsSystemRequired);
+
+        Log.Write($"Send started: {jobs.Count} files, {FormatSize(_runBytes)} -> phone");
+        var canceled = false;
+        string? fatal = null;
+        var phoneFolder = PhoneService.SendFolder;
+        try
+        {
+            phoneFolder = await Task.Run(() => PhoneService.Send(deviceId, jobs, progress, cts.Token));
+        }
+        catch (OperationCanceledException)
+        {
+            canceled = true;
+        }
+        catch (Exception ex)
+        {
+            fatal = ex.Message;
+        }
+        finally
+        {
+            SetThreadExecutionState(EsContinuous);
+            _copyTimer.Stop();
+        }
+
+        Log.Write($"Send ended: sent={progress.FilesDone} skipped={progress.FilesSkipped} failed={progress.FilesFailed} canceled={canceled} deviceLost={progress.DeviceLost} fatal={fatal ?? "-"}");
+        lock (progress.Errors) foreach (var err in progress.Errors.Take(50)) Log.Write("  failed: " + err);
+
+        if (_closeWhenDone)
+        {
+            Close();
+            return;
+        }
+
+        var sent = progress.FilesDone;
+        var sentText = sent == 1 ? "1 file was sent" : $"{sent:N0} files were sent";
+        var problem = true;
+        if (fatal != null)
+        {
+            DoneTitle.Text = "Sending stopped";
+            DoneText.Text = $"{sentText} before this error: {fatal}";
+        }
+        else if (progress.DeviceLost)
+        {
+            DoneTitle.Text = "Phone disconnected";
+            DoneText.Text = $"{sentText} before the connection was lost. Plug it back in and send again: files already there are skipped.";
+        }
+        else if (canceled)
+        {
+            DoneTitle.Text = "Sending stopped";
+            DoneText.Text = $"{sentText}. Send again any time: files already on the phone are skipped.";
+        }
+        else if (progress.FilesFailed > 0)
+        {
+            DoneTitle.Text = "Finished with problems";
+            DoneText.Text = $"{sentText}, but {progress.FilesFailed:N0} could not be written to the phone.";
+        }
+        else
+        {
+            problem = false;
+            DoneTitle.Text = "Sent to phone";
+            DoneText.Text = $"{sentText} to {phoneFolder} on the phone."
+                + (progress.FilesSkipped > 0 ? $"\n{progress.FilesSkipped:N0} were already there and were skipped." : "");
+        }
+
+        DoneIcon.Text = problem ? "" : "";
+        DoneIcon.Foreground = (Brush)FindResource(problem ? "Amber" : "PurpleLight");
+        DoneBadge.Background = (Brush)FindResource(problem ? "AmberSoft" : "PurpleSoft");
+        DoneTip.Text = "Tip: keep the phone unlocked with “File transfer” selected for USB. A USB 3 port and cable make sending much faster.";
+        DoneTip.Visibility = problem ? Visibility.Visible : Visibility.Collapsed;
+        OpenFolderButton.Visibility = Visibility.Collapsed;
+
+        List<string> errors;
+        lock (progress.Errors) errors = progress.Errors.ToList();
+        ShowErrors(errors);
         SetStage(Stage.Done);
         Taskbar.ProgressState = problem ? TaskbarItemProgressState.Error : TaskbarItemProgressState.None;
         if (!IsActive) FlashWindow(new WindowInteropHelper(this).Handle, true);
@@ -633,6 +793,13 @@ public partial class MainWindow : Window
             return;
         }
 
+        // After sending from the "connected" screen there is no library yet: go back there instead.
+        if (_items.Count == 0)
+        {
+            SetStage(Stage.Connected);
+            return;
+        }
+
         SetStage(Stage.Ready);
         await ReplanAsync();
     }
@@ -642,7 +809,8 @@ public partial class MainWindow : Window
     private void SetStage(Stage stage)
     {
         _stage = stage;
-        PanelWait.Visibility = stage is Stage.NoDevice or Stage.Locked or Stage.Scanning ? Visibility.Visible : Visibility.Collapsed;
+        PanelWait.Visibility = stage is Stage.NoDevice or Stage.Locked or Stage.Connected or Stage.Scanning ? Visibility.Visible : Visibility.Collapsed;
+        ConnectedActions.Visibility = stage == Stage.Connected ? Visibility.Visible : Visibility.Collapsed;
         PanelReady.Visibility = stage == Stage.Ready ? Visibility.Visible : Visibility.Collapsed;
         PanelCopy.Visibility = stage == Stage.Copying ? Visibility.Visible : Visibility.Collapsed;
         PanelDone.Visibility = stage == Stage.Done ? Visibility.Visible : Visibility.Collapsed;
@@ -675,6 +843,14 @@ public partial class MainWindow : Window
                         : "Unlock the phone. If it asks what to use USB for, choose “File transfer” (sometimes “Transferring files / Android Auto”).")
                     + " This screen moves on by itself once the photos can be read.";
                 break;
+            case Stage.Connected:
+                DeviceDot.Fill = DotOnline;
+                WaitIcon.Text = "";
+                WaitTitle.Text = "Phone connected";
+                WaitText.Text = "Nothing is read from the phone until you ask. Scan it to copy its photos and videos to this PC"
+                              + (CanSend ? ", or send files to it." : ".");
+                ConnectedSendButton.Visibility = CanSend ? Visibility.Visible : Visibility.Collapsed;
+                break;
             case Stage.Scanning:
                 DeviceDot.Fill = DotOnline;
                 WaitIcon.Text = "";
@@ -683,6 +859,8 @@ public partial class MainWindow : Window
                 break;
             default:
                 DeviceDot.Fill = DotOnline;
+                // iPhones only expose their camera roll read-only over USB, so sending is Android-only.
+                SendButton.Visibility = CanSend ? Visibility.Visible : Visibility.Collapsed;
                 break;
         }
     }

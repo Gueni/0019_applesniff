@@ -11,6 +11,7 @@ A small Windows app that copies all photos and videos from an iPhone or Android 
 - Skips anything already copied, so a run can be stopped and resumed safely.
 - Keeps the original dates, reading them from file names when the phone doesn't store them.
 - Can start copying automatically as soon as a phone is connected.
+- Sends files the other way too (Android only): click **Send files to phone…** or drop files and folders on the window, and they go to the phone's `Download` folder. Files already on the phone are skipped.
 
 ## Install
 
